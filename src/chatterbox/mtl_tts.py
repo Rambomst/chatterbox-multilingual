@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 import os
+from copy import deepcopy
 
 import librosa
 import torch
@@ -250,15 +251,22 @@ class ChatterboxMultilingualTTS:
                 f"Supported languages: {supported_langs}"
             )
         
+        # per-request conditionals
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
-        else:
-            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+
+        assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+
+        # Deep copy conditionals to prevent cross-request contamination
+        conds = Conditionals(
+            t3=deepcopy(self.conds.t3),
+            gen=dict(self.conds.gen),
+        )
 
         # Update exaggeration if needed
-        if float(exaggeration) != float(self.conds.t3.emotion_adv[0, 0, 0].item()):
-            _cond: T3Cond = self.conds.t3
-            self.conds.t3 = T3Cond(
+        if float(exaggeration) != float(conds.t3.emotion_adv[0, 0, 0].item()):
+            _cond: T3Cond = conds.t3
+            conds.t3 = T3Cond(
                 speaker_emb=_cond.speaker_emb,
                 cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
                 emotion_adv=exaggeration * torch.ones(1, 1, 1),
@@ -276,7 +284,7 @@ class ChatterboxMultilingualTTS:
 
         with torch.inference_mode():
             speech_tokens = self.t3.inference(
-                t3_cond=self.conds.t3,
+                t3_cond=conds.t3,
                 text_tokens=text_tokens,
                 max_new_tokens=1000,  # TODO: use the value in config
                 temperature=temperature,
@@ -294,7 +302,7 @@ class ChatterboxMultilingualTTS:
 
             wav, _ = self.s3gen.inference(
                 speech_tokens=speech_tokens,
-                ref_dict=self.conds.gen,
+                ref_dict=conds.gen,
             )
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)

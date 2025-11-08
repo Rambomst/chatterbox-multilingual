@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+from copy import deepcopy
 
 import librosa
 import torch
@@ -209,9 +210,7 @@ class ChatterboxTTS:
             emotion_adv=exaggeration * torch.ones(1, 1, 1),
         ).to(device=self.device)
 
-        conds = Conditionals(t3_cond, s3gen_ref_dict)
-        self.conds = conds
-        return conds
+        return Conditionals(t3_cond, s3gen_ref_dict)
 
     def generate(
         self,
@@ -229,8 +228,9 @@ class ChatterboxTTS:
             conds = self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:
             assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+            # Deep copy t3 conds to prevent cross-request contamination
             conds = Conditionals(
-                t3=self.conds.t3,
+                t3=deepcopy(self.conds.t3),
                 gen=dict(self.conds.gen),
             )
 

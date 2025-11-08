@@ -3,6 +3,7 @@
 import logging
 import threading
 from typing import Optional
+from copy import deepcopy
 
 from tqdm import tqdm
 import torch
@@ -79,7 +80,11 @@ class T3(nn.Module):
     def prepare_conditioning(self, t3_cond: T3Cond):
         """
         Token cond data needs to be embedded, so that needs to be here instead of in `T3CondEnc`.
+        Creates a copy of t3_cond to avoid mutating shared state across concurrent requests.
         """
+        # Deep copy to prevent mutation of shared t3_cond objects
+        t3_cond = deepcopy(t3_cond)
+
         if t3_cond.cond_prompt_speech_tokens is not None and t3_cond.cond_prompt_speech_emb is None:
             t3_cond.cond_prompt_speech_emb = (
                 self.speech_emb(t3_cond.cond_prompt_speech_tokens)
@@ -244,6 +249,10 @@ class T3(nn.Module):
                     self.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
                 )
 
+            # Clone all input tensors to ensure complete isolation from caller's state
+            text_tokens = text_tokens.clone()
+            initial_speech_tokens = initial_speech_tokens.clone()
+
             # Prepare custom input embeds
             embeds, len_cond = self.prepare_input_embeds(
                 t3_cond=t3_cond,
@@ -255,24 +264,24 @@ class T3(nn.Module):
             device = embeds.device
 
             # build a backend tied to THIS request's shapes
-            with self._compile_lock:
-                alignment_stream_analyzer = None
-                if self.hp.is_multilingual:
-                    alignment_stream_analyzer = AlignmentStreamAnalyzer(
-                        self.tfmr,
-                        None,
-                        text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
-                        alignment_layer_idx=9,
-                        eos_idx=self.hp.stop_speech_token,
-                    )
-
-                patched_model = T3HuggingfaceBackend(
-                    config=self.cfg,
-                    llama=self.tfmr,
-                    speech_enc=self.speech_emb,
-                    speech_head=self.speech_head,
-                    alignment_stream_analyzer=alignment_stream_analyzer,
+            # AlignmentStreamAnalyzer and patched_model are created per-request inside gen_lock
+            alignment_stream_analyzer = None
+            if self.hp.is_multilingual:
+                alignment_stream_analyzer = AlignmentStreamAnalyzer(
+                    self.tfmr,
+                    None,
+                    text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
+                    alignment_layer_idx=9,
+                    eos_idx=self.hp.stop_speech_token,
                 )
+
+            patched_model = T3HuggingfaceBackend(
+                config=self.cfg,
+                llama=self.tfmr,
+                speech_enc=self.speech_emb,
+                speech_head=self.speech_head,
+                alignment_stream_analyzer=alignment_stream_analyzer,
+            )
 
             bos_token = torch.tensor([[self.hp.start_speech_token]], dtype=torch.long, device=device)
             bos_embed = self.speech_emb(bos_token)
@@ -351,4 +360,9 @@ class T3(nn.Module):
                 past = output.past_key_values
 
             predicted_tokens = torch.cat(predicted, dim=1)
+
+            # Clear KV cache to prevent bleeding into next request
+            del past, output, patched_model
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
             return predicted_tokens
