@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import threading
 
 import numpy as np
 import torch
@@ -38,7 +39,7 @@ def drop_invalid_tokens(x):
     return x[x < SPEECH_VOCAB_SIZE]
 
 
-# TODO: global resampler cache
+# global resampler cache
 @lru_cache(100)
 def get_resampler(src_sr, dst_sr, device):
     return ta.transforms.Resample(src_sr, dst_sr).to(device)
@@ -49,6 +50,9 @@ class S3Token2Mel(torch.nn.Module):
     CosyVoice2's CFM decoder maps S3 speech tokens to mel-spectrograms.
 
     TODO: make these modules configurable?
+
+    We add a per-instance lock around the flow inference to make it safe
+    for multiple concurrent requests that share the same model instance.
     """
     def __init__(self):
         super().__init__()
@@ -97,7 +101,11 @@ class S3Token2Mel(torch.nn.Module):
             decoder=decoder
         )
 
+        # per-instance resamplers
         self.resamplers = {}
+
+        # serialize flow inference for this instance
+        self._infer_lock = threading.Lock()
 
     @property
     def device(self):
@@ -182,30 +190,38 @@ class S3Token2Mel(torch.nn.Module):
         - `ref_sr`: reference sample rate
         - `finalize`: whether streaming is finished or not. Note that if False, the last 3 tokens will be ignored.
         """
-        assert (ref_wav is None) ^ (ref_dict is None), f"Must provide exactly one of ref_wav or ref_dict (got {ref_wav} and {ref_dict})"
-
-        if ref_dict is None:
-            ref_dict = self.embed_ref(ref_wav, ref_sr)
-        else:
-            # type/device casting (all values will be numpy if it's from a prod API call)
-            for rk in list(ref_dict):
-                if isinstance(ref_dict[rk], np.ndarray):
-                    ref_dict[rk] = torch.from_numpy(ref_dict[rk])
-                if torch.is_tensor(ref_dict[rk]):
-                    ref_dict[rk] = ref_dict[rk].to(self.device)
-
-        if len(speech_tokens.shape) == 1:
-            speech_tokens = speech_tokens.unsqueeze(0)
-
-        # assert speech_tokens.shape[0] == 1, "only batch size of one allowed for now"
-        speech_token_lens = torch.LongTensor([speech_tokens.size(1)]).to(self.device)
-
-        output_mels, _ = self.flow.inference(
-            token=speech_tokens,
-            token_len=speech_token_lens,
-            finalize=finalize,
-            **ref_dict,
+        assert (ref_wav is None) ^ (ref_dict is None), (
+            f"Must provide exactly one of ref_wav or ref_dict (got {ref_wav} and {ref_dict})"
         )
+
+        # make incoming ref_dict safe for this call
+        if ref_dict is not None:
+            safe_ref_dict = {}
+            for k, v in ref_dict.items():
+                if isinstance(v, np.ndarray):
+                    v = torch.from_numpy(v)
+                if torch.is_tensor(v):
+                    v = v.to(self.device).clone()
+                safe_ref_dict[k] = v
+            ref_dict = safe_ref_dict
+
+        with self._infer_lock:
+            # if no ref_dict, build one now
+            if ref_dict is None:
+                ref_dict = self.embed_ref(ref_wav, ref_sr)
+
+            if len(speech_tokens.shape) == 1:
+                speech_tokens = speech_tokens.unsqueeze(0)
+
+            speech_token_lens = torch.LongTensor([speech_tokens.size(1)]).to(self.device)
+
+            output_mels, _ = self.flow.inference(
+                token=speech_tokens,
+                token_len=speech_token_lens,
+                finalize=finalize,
+                **ref_dict,
+            )
+
         return output_mels
 
 
@@ -214,8 +230,10 @@ class S3Token2Wav(S3Token2Mel):
     The decoder of CosyVoice2 is a concat of token-to-mel (CFM) and a mel-to-waveform (HiFiGAN) modules.
 
     TODO: make these modules configurable?
-    """
 
+    We inherit the flow lock from S3Token2Mel, and add a small lock around HiFiGAN
+    in case it keeps small caches internally.
+    """
     def __init__(self):
         super().__init__()
 
@@ -235,6 +253,9 @@ class S3Token2Wav(S3Token2Mel):
         trim_fade[n_trim:] = (torch.cos(torch.linspace(torch.pi, 0, n_trim)) + 1) / 2
         self.register_buffer("trim_fade", trim_fade, persistent=False) # (buffers get automatic device casting)
 
+        # separate lock for HiFiGAN
+        self._wav_lock = threading.Lock()
+
     def forward(
         self,
         speech_tokens,
@@ -245,16 +266,25 @@ class S3Token2Wav(S3Token2Mel):
         ref_dict: Optional[dict] = None,
         finalize: bool = False
     ):
-        output_mels = super().forward(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize)
+        # flow part (already locked in parent)
+        output_mels = super().forward(
+            speech_tokens,
+            ref_wav=ref_wav,
+            ref_sr=ref_sr,
+            ref_dict=ref_dict,
+            finalize=finalize,
+        )
 
-        # TODO jrm: ignoring the speed control (mel interpolation) and the HiFTGAN caching mechanisms for now.
-        hift_cache_source = torch.zeros(1, 1, 0).to(self.device)
-
-        output_wavs, *_ = self.mel2wav.inference(speech_feat=output_mels, cache_source=hift_cache_source)
+        # mel -> wav
+        with self._wav_lock:
+            hift_cache_source = torch.zeros(1, 1, 0).to(self.device)
+            output_wavs, *_ = self.mel2wav.inference(
+                speech_feat=output_mels,
+                cache_source=hift_cache_source,
+            )
 
         if not self.training:
-            # NOTE: ad-hoc method to reduce "spillover" from the reference clip.
-            output_wavs[:, :len(self.trim_fade)] *= self.trim_fade
+            output_wavs[:, : len(self.trim_fade)] *= self.trim_fade
 
         return output_wavs
 
@@ -269,13 +299,20 @@ class S3Token2Wav(S3Token2Mel):
         ref_dict: Optional[dict] = None,
         finalize: bool = False,
     ):
-        return super().forward(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize)
+        return super().forward(
+            speech_tokens,
+            ref_wav=ref_wav,
+            ref_sr=ref_sr,
+            ref_dict=ref_dict,
+            finalize=finalize,
+        )
 
     @torch.inference_mode()
     def hift_inference(self, speech_feat, cache_source: torch.Tensor = None):
         if cache_source is None:
             cache_source = torch.zeros(1, 1, 0).to(self.device)
-        return self.mel2wav.inference(speech_feat=speech_feat, cache_source=cache_source)
+        with self._wav_lock:
+            return self.mel2wav.inference(speech_feat=speech_feat, cache_source=cache_source)
 
     @torch.inference_mode()
     def inference(
@@ -289,10 +326,23 @@ class S3Token2Wav(S3Token2Mel):
         cache_source: torch.Tensor = None, # NOTE: this arg is for streaming, it can probably be removed here
         finalize: bool = True,
     ):
-        output_mels = self.flow_inference(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize)
-        output_wavs, output_sources = self.hift_inference(output_mels, cache_source)
+        output_mels = self.flow_inference(
+            speech_tokens,
+            ref_wav=ref_wav,
+            ref_sr=ref_sr,
+            ref_dict=ref_dict,
+            finalize=finalize,
+        )
 
-        # NOTE: ad-hoc method to reduce "spillover" from the reference clip.
-        output_wavs[:, :len(self.trim_fade)] *= self.trim_fade
+        with self._wav_lock:
+            if cache_source is None:
+                cache_source = torch.zeros(1, 1, 0).to(self.device)
+            output_wavs, output_sources = self.mel2wav.inference(
+                speech_feat=output_mels,
+                cache_source=cache_source,
+            )
+
+        if not self.training:
+            output_wavs[:, : len(self.trim_fade)] *= self.trim_fade
 
         return output_wavs, output_sources
