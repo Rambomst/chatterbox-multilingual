@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 from pathlib import Path
-from copy import deepcopy
 
 import librosa
 import torch
@@ -228,10 +227,10 @@ class ChatterboxTTS:
             conds = self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:
             assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
-            # Deep copy t3 conds to prevent cross-request contamination
+            # Clone t3 conds to prevent cross-request contamination
             conds = Conditionals(
-                t3=deepcopy(self.conds.t3),
-                gen=dict(self.conds.gen),
+                t3=self.conds.t3.clone(),
+                gen={k: v.clone() if torch.is_tensor(v) else v for k, v in self.conds.gen.items()},
             )
 
         # Update exaggeration if needed

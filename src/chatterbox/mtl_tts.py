@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
 import os
-from copy import deepcopy
 
 import librosa
 import torch
@@ -257,10 +256,10 @@ class ChatterboxMultilingualTTS:
 
         assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
-        # Deep copy conditionals to prevent cross-request contamination
+        # Clone conditionals to prevent cross-request contamination
         conds = Conditionals(
-            t3=deepcopy(self.conds.t3),
-            gen=dict(self.conds.gen),
+            t3=self.conds.t3.clone(),
+            gen={k: v.clone() if torch.is_tensor(v) else v for k, v in self.conds.gen.items()},
         )
 
         # Update exaggeration if needed
