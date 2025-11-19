@@ -4,10 +4,8 @@ version = "0.1.4"
 description = "Chatterbox: Open Source TTS and Voice Conversion by Resemble AI"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {file = "LICENSE"}
-authors = [
-    {name = "resemble-ai", email = "engineering@resemble.ai"}
-]
+license = { file = "LICENSE" }
+authors = [{ name = "resemble-ai", email = "engineering@resemble.ai" }]
 dependencies = [
     "numpy>=1.24.0,<1.26.0",
     "librosa==0.11.0",
@@ -19,11 +17,14 @@ dependencies = [
     "resemble-perth==1.0.1",
     "conformer==0.3.2",
     "safetensors==0.5.3",
-    "pkuseg ==0.0.25",
     "pykakasi==2.3.0",
     "gradio==5.44.1",
-
 ]
+
+# extra chinese support
+# to install use pip install or uv sync --extra chinese
+[project.optional-dependencies]
+chinese = ["pkuseg>=0.0.25"]
 
 [project.urls]
 Homepage = "https://github.com/resemble-ai/chatterbox"
