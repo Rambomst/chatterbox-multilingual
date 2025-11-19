@@ -303,7 +303,7 @@ class ChatterboxTTS:
     def generate(
         self,
         text,
-        repetition_penalty=1.2,
+        repetition_penalty=1.7,
         min_p=0.05,
         top_p=1.0,
         audio_prompt_path=None,
