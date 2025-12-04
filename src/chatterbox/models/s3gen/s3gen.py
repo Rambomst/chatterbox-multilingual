@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import threading
 
 import numpy as np
 import torch
@@ -102,6 +103,9 @@ class S3Token2Mel(torch.nn.Module):
 
         # per-instance resamplers
         self.resamplers = {}
+
+        # Serialize flow inference when a single model instance is shared
+        self._infer_lock = threading.Lock()
 
     @property
     def device(self):
@@ -201,21 +205,22 @@ class S3Token2Mel(torch.nn.Module):
                 safe_ref_dict[k] = v
             ref_dict = safe_ref_dict
 
-        # if no ref_dict, build one now
-        if ref_dict is None:
-            ref_dict = self.embed_ref(ref_wav, ref_sr)
+        with self._infer_lock:
+            # if no ref_dict, build one now
+            if ref_dict is None:
+                ref_dict = self.embed_ref(ref_wav, ref_sr)
 
-        if len(speech_tokens.shape) == 1:
-            speech_tokens = speech_tokens.unsqueeze(0)
+            if len(speech_tokens.shape) == 1:
+                speech_tokens = speech_tokens.unsqueeze(0)
 
-        speech_token_lens = torch.LongTensor([speech_tokens.size(1)]).to(self.device)
+            speech_token_lens = torch.LongTensor([speech_tokens.size(1)]).to(self.device)
 
-        output_mels, _ = self.flow.inference(
-            token=speech_tokens,
-            token_len=speech_token_lens,
-            finalize=finalize,
-            **ref_dict,
-        )
+            output_mels, _ = self.flow.inference(
+                token=speech_tokens,
+                token_len=speech_token_lens,
+                finalize=finalize,
+                **ref_dict,
+            )
 
         return output_mels
 
@@ -248,6 +253,9 @@ class S3Token2Wav(S3Token2Mel):
         trim_fade[n_trim:] = (torch.cos(torch.linspace(torch.pi, 0, n_trim)) + 1) / 2
         self.register_buffer("trim_fade", trim_fade, persistent=False) # (buffers get automatic device casting)
 
+        # Separate lock for HiFiGAN to guard internal caches when sharing an instance
+        self._wav_lock = threading.Lock()
+
     def forward(
         self,
         speech_tokens,
@@ -268,11 +276,12 @@ class S3Token2Wav(S3Token2Mel):
         )
 
         # mel -> wav
-        hift_cache_source = torch.zeros(1, 1, 0).to(self.device)
-        output_wavs, *_ = self.mel2wav.inference(
-            speech_feat=output_mels,
-            cache_source=hift_cache_source,
-        )
+        with self._wav_lock:
+            hift_cache_source = torch.zeros(1, 1, 0).to(self.device)
+            output_wavs, *_ = self.mel2wav.inference(
+                speech_feat=output_mels,
+                cache_source=hift_cache_source,
+            )
 
         if not self.training:
             output_wavs[:, : len(self.trim_fade)] *= self.trim_fade
@@ -302,7 +311,8 @@ class S3Token2Wav(S3Token2Mel):
     def hift_inference(self, speech_feat, cache_source: torch.Tensor = None):
         if cache_source is None:
             cache_source = torch.zeros(1, 1, 0).to(self.device)
-        return self.mel2wav.inference(speech_feat=speech_feat, cache_source=cache_source)
+        with self._wav_lock:
+            return self.mel2wav.inference(speech_feat=speech_feat, cache_source=cache_source)
 
     @torch.inference_mode()
     def inference(
@@ -326,10 +336,11 @@ class S3Token2Wav(S3Token2Mel):
 
         if cache_source is None:
             cache_source = torch.zeros(1, 1, 0).to(self.device)
-        output_wavs, output_sources = self.mel2wav.inference(
-            speech_feat=output_mels,
-            cache_source=cache_source,
-        )
+        with self._wav_lock:
+            output_wavs, output_sources = self.mel2wav.inference(
+                speech_feat=output_mels,
+                cache_source=cache_source,
+            )
 
         if not self.training:
             output_wavs[:, : len(self.trim_fade)] *= self.trim_fade

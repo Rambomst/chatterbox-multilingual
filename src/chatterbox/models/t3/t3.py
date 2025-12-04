@@ -352,88 +352,78 @@ class T3(nn.Module):
             penalty=float(repetition_penalty)
         )
 
-        output = patched_model(
-            inputs_embeds=inputs_embeds,
-            past_key_values=None,
-            use_cache=True,
-            output_attentions=False,
-            output_hidden_states=False,
-            return_dict=True,
-        )
-        past = output.past_key_values
-
-        max_steps = max_new_tokens or self.hp.max_speech_tokens
-
-        for i in tqdm(range(max_steps), desc="Sampling", dynamic_ncols=True):
-            logits_step = output.logits[:, -1, :]
-
-            # CFG
-            cond = logits_step[0:1, :]
-            uncond = logits_step[1:2, :]
-            cfg = torch.as_tensor(cfg_weight, device=cond.device, dtype=cond.dtype)
-            logits = cond + cfg * (cond - uncond)
-
-            if patched_model.alignment_stream_analyzer is not None:
-                if logits.dim() == 1:
-                    logits = logits.unsqueeze(0)
-                last_token = generated_ids[0, -1].item() if generated_ids.size(1) > 0 else None
-                logits = patched_model.alignment_stream_analyzer.step(
-                    logits, next_token=last_token
-                )
-
-            ids_for_proc = generated_ids[:1, ...]
-            logits = repetition_penalty_processor(ids_for_proc, logits)
-
-            if temperature != 1.0:
-                logits = logits / temperature
-            logits = min_p_warper(ids_for_proc, logits)
-            logits = top_p_warper(ids_for_proc, logits)
-
-            probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-
-            predicted.append(next_token)
-            generated_ids = torch.cat([generated_ids, next_token], dim=1)
-
-            if next_token.view(-1) == self.hp.stop_speech_token:
-                logger.info(f"✅ EOS token detected! Stopping generation at step {i+1}")
-                break
-
-            next_token_embed = self.speech_emb(next_token)
-            next_token_embed = next_token_embed + self.speech_pos_emb.get_fixed_embedding(i + 1)
-            next_token_embed = torch.cat([next_token_embed, next_token_embed])
-
+        try:
             output = patched_model(
-                inputs_embeds=next_token_embed,
-                past_key_values=past,
+                inputs_embeds=inputs_embeds,
+                past_key_values=None,
+                use_cache=True,
                 output_attentions=False,
                 output_hidden_states=False,
                 return_dict=True,
             )
             past = output.past_key_values
 
-        try:
-            predicted_tokens = torch.cat(predicted, dim=1)
-        except Exception as e:
-            logger.error(f"Error concatenating predicted tokens. predicted length: {len(predicted)}")
-            logger.error(f"predicted contents: {[type(p) for p in predicted[:5]]}")  # First 5 items
-            raise RuntimeError(f"Failed to concatenate predicted tokens: {e}") from e
+            max_steps = max_new_tokens or self.hp.max_speech_tokens
 
-        # Comprehensive cleanup to prevent memory leaks
-        del predicted
-        del generated_ids
-        del past
-        del output
-        del patched_model
-        if alignment_stream_analyzer is not None:
-            # Remove hooks to prevent interference with concurrent requests
-            alignment_stream_analyzer.cleanup()
-            del alignment_stream_analyzer
-        del embeds
-        del inputs_embeds
-        del bos_embed
-        del bos_token
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            for i in tqdm(range(max_steps), desc="Sampling", dynamic_ncols=True):
+                logits_step = output.logits[:, -1, :]
 
-        return predicted_tokens
+                # CFG
+                cond = logits_step[0:1, :]
+                uncond = logits_step[1:2, :]
+                cfg = torch.as_tensor(cfg_weight, device=cond.device, dtype=cond.dtype)
+                logits = cond + cfg * (cond - uncond)
+
+                if patched_model.alignment_stream_analyzer is not None:
+                    if logits.dim() == 1:
+                        logits = logits.unsqueeze(0)
+                    last_token = generated_ids[0, -1].item() if generated_ids.size(1) > 0 else None
+                    logits = patched_model.alignment_stream_analyzer.step(
+                        logits, next_token=last_token
+                    )
+
+                ids_for_proc = generated_ids[:1, ...]
+                logits = repetition_penalty_processor(ids_for_proc, logits)
+
+                if temperature != 1.0:
+                    logits = logits / temperature
+                logits = min_p_warper(ids_for_proc, logits)
+                logits = top_p_warper(ids_for_proc, logits)
+
+                probs = torch.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+
+                predicted.append(next_token)
+                generated_ids = torch.cat([generated_ids, next_token], dim=1)
+
+                if next_token.view(-1) == self.hp.stop_speech_token:
+                    logger.info(f"✅ EOS token detected! Stopping generation at step {i+1}")
+                    break
+
+                next_token_embed = self.speech_emb(next_token)
+                next_token_embed = next_token_embed + self.speech_pos_emb.get_fixed_embedding(i + 1)
+                next_token_embed = torch.cat([next_token_embed, next_token_embed])
+
+                output = patched_model(
+                    inputs_embeds=next_token_embed,
+                    past_key_values=past,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+                past = output.past_key_values
+
+            try:
+                predicted_tokens = torch.cat(predicted, dim=1)
+            except Exception as e:
+                logger.error(f"Error concatenating predicted tokens. predicted length: {len(predicted)}")
+                logger.error(f"predicted contents: {[type(p) for p in predicted[:5]]}")  # First 5 items
+                raise RuntimeError(f"Failed to concatenate predicted tokens: {e}") from e
+
+            return predicted_tokens
+        finally:
+            # Remove hooks to prevent interference with concurrent requests even on error paths
+            if alignment_stream_analyzer is not None:
+                alignment_stream_analyzer.cleanup()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()

@@ -259,8 +259,8 @@ class ChatterboxTTS:
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
         """
         Build conditionals from a reference wav and return them.
-        Also stores them on self for backwards compatibility, but callers
-        should prefer using the returned value to avoid cross-request clashes.
+        Callers should pass the returned object into `generate` to avoid
+        cross-request clashes.
         """
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
         ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
@@ -303,7 +303,8 @@ class ChatterboxTTS:
     def generate(
         self,
         text,
-        repetition_penalty=1.7,
+        conds: Conditionals = None,
+        repetition_penalty=None,
         min_p=0.05,
         top_p=1.0,
         audio_prompt_path=None,
@@ -311,16 +312,21 @@ class ChatterboxTTS:
         cfg_weight=0.5,
         temperature=0.8,
     ):
-        # per-request conditionals
-        if audio_prompt_path:
+        # per-request conditionals (prefer explicit over internal state)
+        if conds is not None:
+            conds = Conditionals(
+                t3=conds.t3.clone(),
+                gen={k: v.clone() if torch.is_tensor(v) else v for k, v in conds.gen.items()},
+            )
+        elif audio_prompt_path:
             conds = self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:
-            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
-            # Clone t3 conds to prevent cross-request contamination
+            assert self.conds is not None, "Please provide `conds`, call `prepare_conditionals`, or specify `audio_prompt_path`"
             conds = Conditionals(
                 t3=self.conds.t3.clone(),
                 gen={k: v.clone() if torch.is_tensor(v) else v for k, v in self.conds.gen.items()},
             )
+        conds.to(self.device)
 
         # Update exaggeration if needed
         if exaggeration != conds.t3.emotion_adv[0, 0, 0]:
@@ -330,6 +336,10 @@ class ChatterboxTTS:
                 cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
                 emotion_adv=exaggeration * torch.ones(1, 1, 1),
             ).to(device=self.device)
+
+        # Resolve repetition penalty: prefer request value, else config, else legacy default
+        if repetition_penalty is None:
+            repetition_penalty = getattr(self.t3.hp, "repetition_penalty", 1.2)
 
         # Use pooled instance for inference if available
         if self._pool is not None:

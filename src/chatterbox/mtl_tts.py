@@ -310,12 +310,13 @@ class ChatterboxMultilingualTTS:
             cond_prompt_speech_tokens=t3_cond_prompt_tokens,
             emotion_adv=exaggeration * torch.ones(1, 1, 1),
         ).to(device=self.device)
-        self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+        return Conditionals(t3_cond, s3gen_ref_dict)
 
     def generate(
         self,
         text,
         language_id,
+        conds: Conditionals = None,
         audio_prompt_path=None,
         exaggeration=0.5,
         cfg_weight=0.5,
@@ -332,17 +333,21 @@ class ChatterboxMultilingualTTS:
                 f"Supported languages: {supported_langs}"
             )
 
-        # per-request conditionals
-        if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
-
-        assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
-
-        # Clone conditionals to prevent cross-request contamination
-        conds = Conditionals(
-            t3=self.conds.t3.clone(),
-            gen={k: v.clone() if torch.is_tensor(v) else v for k, v in self.conds.gen.items()},
-        )
+        # per-request conditionals (prefer explicit over internal state)
+        if conds is not None:
+            conds = Conditionals(
+                t3=conds.t3.clone(),
+                gen={k: v.clone() if torch.is_tensor(v) else v for k, v in conds.gen.items()},
+            )
+        elif audio_prompt_path:
+            conds = self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        else:
+            assert self.conds is not None, "Please provide `conds`, call `prepare_conditionals`, or specify `audio_prompt_path`"
+            conds = Conditionals(
+                t3=self.conds.t3.clone(),
+                gen={k: v.clone() if torch.is_tensor(v) else v for k, v in self.conds.gen.items()},
+            )
+        conds.to(self.device)
 
         # Update exaggeration if needed
         if float(exaggeration) != float(conds.t3.emotion_adv[0, 0, 0].item()):
